@@ -4,8 +4,10 @@ package node
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/despreston/go-craq/store"
 	"github.com/despreston/go-craq/transport"
@@ -201,8 +203,38 @@ func (n *Node) writePropagated(reply *transport.PropagateResponse) error {
 	return nil
 }
 
+func (n *Node) commit(key string, version uint64) error {
+	const maxRetries = 15
+	const retryInterval = 1000 * time.Millisecond
+
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		err := n.store.Commit(key, version)
+		if err == nil {
+			n.latest[key] = version
+			if n.committed != nil {
+				n.committed <- commitEvent{Key: key, Version: version}
+			}
+			return nil
+		}
+
+		if errors.Is(err, store.ErrNotFound) {
+			lastErr = err
+			time.Sleep(retryInterval)
+			continue
+		}
+
+		// 其他错误不重试
+		return err
+	}
+
+	return fmt.Errorf("node commit retry failed for key %s version %d: %v", key, version, lastErr)
+}
+
 // Commit the version to the store, update n.latest for this key, and announce
 // the commit to the n.committed channel if there is one.
+/*
 func (n *Node) commit(key string, version uint64) error {
 	if err := n.store.Commit(key, version); err != nil {
 		//n.log.Printf("Failed to commit. Key: %s Version: %d Error: %#v", key, version, err)
@@ -218,7 +250,7 @@ func (n *Node) commit(key string, version uint64) error {
 	}
 
 	return nil
-}
+}*/
 
 func (n *Node) commitPropagated(reply *transport.PropagateResponse) error {
 	// Commit items from reply to store.

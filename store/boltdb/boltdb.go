@@ -1,27 +1,86 @@
 package boltdb
 
-// TODO: I'm sure most of these methods are dead fucking slow and can be
-// improved.
-
 import (
+	"errors"
 	"fmt"
 	"log"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/despreston/go-craq/store"
 	bolt "go.etcd.io/bbolt"
 )
 
+type opType int
+
+const (
+	opWrite opType = iota
+	opCommit
+)
+
+type opRequest struct {
+	typ        opType
+	key        string
+	val        []byte // only for write
+	version    uint64
+	replicaPos string // only for write
+	resp       chan error
+}
+
 type Bolt struct {
 	DB     *bolt.DB
 	file   string
 	bucket []byte
+
+	opC       chan opRequest
+	wg        sync.WaitGroup
+	closed    int32
+	closeOnce sync.Once
 }
 
 func New(f, b string) *Bolt {
-	return &Bolt{
+	bolt := &Bolt{
 		file:   f,
 		bucket: []byte(b),
+		opC:    make(chan opRequest, 1024),
 	}
+	bolt.wg.Add(1)
+	go bolt.loop()
+	return bolt
+}
+
+func (b *Bolt) loop() {
+	defer b.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("loop panic: %v", r)
+		}
+	}()
+
+	for req := range b.opC {
+		var err error
+
+		switch req.typ {
+		case opWrite:
+			err = b.doWrite(req.key, req.val, req.version, req.replicaPos)
+		case opCommit:
+			err = b.doCommit(req.key, req.version)
+		default:
+			err = fmt.Errorf("unknown op type: %v", req.typ)
+		}
+
+		// 尝试回应 resp（不会因为接收方未读导致卡死）
+		select {
+		case req.resp <- err:
+		default:
+			log.Printf("WARNING: response channel blocked or full for key %s (type %d), dropping result", req.key, req.typ)
+		}
+	}
+}
+
+func (b *Bolt) isClosed() bool {
+	return atomic.LoadInt32(&b.closed) != 0
 }
 
 func (b *Bolt) Connect() error {
@@ -30,7 +89,6 @@ func (b *Bolt) Connect() error {
 		return err
 	}
 
-	// create bucket
 	err = DB.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte(b.bucket))
 		if err != nil {
@@ -38,11 +96,9 @@ func (b *Bolt) Connect() error {
 		}
 		return nil
 	})
-
 	if err != nil {
 		return err
 	}
-
 	b.DB = DB
 	return nil
 }
@@ -73,6 +129,46 @@ func (b *Bolt) Read(key string) (*store.Item, error) {
 }
 
 func (b *Bolt) Write(key string, val []byte, version uint64, replicaPos string) error {
+	resp := make(chan error, 1)
+	return b.sendOp(opRequest{
+		typ:        opWrite,
+		key:        key,
+		val:        val,
+		version:    version,
+		replicaPos: replicaPos,
+		resp:       resp,
+	})
+}
+
+func (b *Bolt) Commit(key string, version uint64) error {
+	resp := make(chan error, 1)
+	return b.sendOp(opRequest{
+		typ:     opCommit,
+		key:     key,
+		version: version,
+		resp:    resp,
+	})
+}
+
+func (b *Bolt) sendOp(req opRequest) error {
+	if b.isClosed() {
+		return fmt.Errorf("bolt db is closed")
+	}
+
+	select {
+	case b.opC <- req:
+		select {
+		case err := <-req.resp:
+			return err
+		case <-time.After(3 * time.Second):
+			return fmt.Errorf("timeout waiting for response for key %s", req.key)
+		}
+	case <-time.After(3 * time.Second):
+		return fmt.Errorf("timeout sending request for key %s", req.key)
+	}
+}
+
+func (b *Bolt) doWrite(key string, val []byte, version uint64, replicaPos string) error {
 	var v []*store.Item
 	k := []byte(key)
 
@@ -109,66 +205,77 @@ func (b *Bolt) Write(key string, val []byte, version uint64, replicaPos string) 
 	})
 }
 
-func (b *Bolt) Commit(key string, version uint64) error {
+func (b *Bolt) doCommit(key string, version uint64) error {
+	const maxRetries = 10
+	const retryInterval = 300 * time.Millisecond
+
 	k := []byte(key)
 
-	return b.DB.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(b.bucket)
-		result := bucket.Get(k)
+	var lastErr error
 
-		if result == nil {
-			return store.ErrNotFound
-		}
+	for i := 0; i < maxRetries; i++ {
+		err := b.DB.Update(func(tx *bolt.Tx) error {
+			bucket := tx.Bucket(b.bucket)
+			result := bucket.Get(k)
+			if result == nil {
+				return store.ErrNotFound
+			}
 
-		items, err := store.DecodeMany(result)
-		if err != nil {
-			return err
-		}
+			items, err := store.DecodeMany(result)
+			if err != nil {
+				return err
+			}
 
-		// Find index of older versions and mark the item that matches the version
-		// being committed as committed.
-		/*
-			var older int
-			for i, itm := range items {
+			var found bool
+			var newItems []*store.Item
+			for _, itm := range items {
+				if itm.Version < version {
+					continue
+				}
 				if itm.Version == version {
 					itm.Committed = true
-					older = i - 1
-					break
+					found = true
 				}
+				newItems = append(newItems, itm)
 			}
 
-			// Remove older items
-			if older > -1 {
-				items = items[older+1:]
+			if !found {
+				return store.ErrNotFound
 			}
-		*/
-		// ——————————————————————————————
-		var found bool
-		var newItems []*store.Item
-		for _, itm := range items {
-			if itm.Version < version {
-				continue // skip older versions
+
+			encoded, err := store.Encode(newItems)
+			if err != nil {
+				return err
 			}
-			if itm.Version == version {
-				itm.Committed = true
-				found = true
-			}
-			newItems = append(newItems, itm)
+			return bucket.Put(k, encoded)
+		})
+
+		if err == nil {
+			return nil // 成功了
 		}
 
-		if !found {
-			return fmt.Errorf("version %d not found for key %s", version, key)
+		if errors.Is(err, store.ErrNotFound) {
+			lastErr = err
+			time.Sleep(retryInterval)
+			continue
 		}
 
-		encoded, err := store.Encode(newItems)
-		// ——————————————————————————————
-		// encoded, err := store.Encode(items)
-		if err != nil {
-			return err
-		}
+		return err // 非 NotFound 错误，立即返回
+	}
 
-		return bucket.Put(k, encoded)
+	return fmt.Errorf("Commit retry failed for key %s version %d: %v", key, version, lastErr)
+}
+
+func (b *Bolt) Close() error {
+	b.closeOnce.Do(func() {
+		atomic.StoreInt32(&b.closed, 1)
+		close(b.opC) // 触发 loop 退出
+		b.wg.Wait()
+		if b.DB != nil {
+			b.DB.Close()
+		}
 	})
+	return nil
 }
 
 func (b *Bolt) ReadVersion(key string, version uint64) (*store.Item, error) {

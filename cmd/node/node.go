@@ -15,10 +15,10 @@ import (
 func main() {
 	var addr, pub, cdr, dbFile string
 
-	flag.StringVar(&addr, "a", ":1235", "Local address to listen on")
-	flag.StringVar(&pub, "p", ":1235", "Public address reachable by coordinator and other nodes")
+	flag.StringVar(&addr, "a", ":1237", "Local address to listen on")
+	flag.StringVar(&pub, "p", ":1237", "Public address reachable by coordinator and other nodes")
 	flag.StringVar(&cdr, "c", ":1234", "Coordinator address")
-	flag.StringVar(&dbFile, "f", "craq.db", "Bolt DB database file")
+	flag.StringVar(&dbFile, "f", "craq3.db", "Bolt DB database file")
 	flag.Parse()
 	//打开本地存储
 	db := boltdb.New(dbFile, "yessir")

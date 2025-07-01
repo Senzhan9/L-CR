@@ -17,13 +17,11 @@ RUN apk update && apk add --no-cache \
 WORKDIR /opt/craq
 
 # 拷入本地交叉编译好的可执行
-COPY craq-coordinator       /opt/craq/craq-coordinator
-COPY craq-node              /opt/craq/craq-node
-COPY craq-client            /opt/craq/craq-client
-COPY craq-bench-write       /opt/craq/craq-benchwrite
-COPY craq-bench-read        /opt/craq/craq-benchread
-COPY craq-bench-test        /opt/craq/craq-benchtest
-COPY craq-generate          /opt/craq/craq-generate
+COPY craq-coordinator        /opt/craq/craq-coordinator
+COPY craq-node               /opt/craq/craq-node
+COPY craq-client             /opt/craq/craq-client
+COPY craq-benchtest          /opt/craq/craq-bench-test
+COPY craq-generate           /opt/craq/craq-generate
 
 # 拷入启动脚本
 COPY setup_tc.sh            /opt/craq/setup_tc.sh
